@@ -10,7 +10,9 @@ This is the "streaming + barge-in" upgrade from the Voice Agent Build Guide — 
 turn-based Voice Hub is missing. STT = SCRIBE's Whisper. LLM = your Groq key. TTS = FRIDAY's exact voice.
 
 Modes:
-    python vox.py                 # LIVE — real mic conversation with barge-in (say "goodbye" to exit)
+    python vox.py                 # PUSH-TO-TALK (default) — press ENTER, then speak (Start_VOX.bat)
+    python vox.py --wake          # HANDS-FREE wake word — say "Hey Vox" then your question (Start_VOX_HeyVox.bat)
+    python vox.py --hands-free    # always-listening — responds to ANY speech (quiet rooms only)
     python vox.py --text "hi"     # feed text → LLM(+tools) → speak the reply (no mic)
     python vox.py --test          # full pipeline self-test: TTS a question → STT it → LLM → TTS reply
                                   #   (proves every stage without a mic)
@@ -31,13 +33,28 @@ LLM_BASE = os.getenv("VOX_LLM_BASE", "https://api.groq.com/openai/v1")
 SR = 16000                    # mic sample rate for VAD + Whisper
 FRAME_MS = 20
 FRAME = SR * FRAME_MS // 1000  # 320 samples/frame
-SYSTEM = ("You are Vox, a friendly, concise voice assistant. Your name is Vox — always write and say it as a "
-          "single word (Vox), never spell it out. Keep replies to 1-2 sentences — you are being spoken aloud. "
-          "Use tools when they help. If the user says goodbye, say a short farewell. "
-          "You are part of Leslie Moody's AI team; Leslie is your creator (he/him) — refer to him as he/him. "
-          "Friday is the command-line voice assistant — always address "
-          "her as Friday. Jarvis is Leslie's main voice assistant — always address him as Jarvis. Use these "
-          "names whenever you speak to or about them.")
+WAKE = os.getenv("VOX_WAKE", "Hey Vox")               # wake phrase for hands-free mode
+# Whisper (base.en) often mishears 'Vox' — accept these look-alikes as the wake token.
+_WAKE_ALTS = ("vox", "box", "fox", "vaux", "volks", "folks", "walks", "vaults", "vault",
+              "vocs", "vex", "bucks", "vaux", "vaughs", "faux", "vox's")
+
+_PERSONA = ("You are Vox, a friendly, concise voice assistant. Your name is Vox — always write and say it as a "
+            "single word (Vox), never spell it out. Keep replies to 1-2 sentences — you are being spoken aloud. "
+            "Use tools when they help. If the user says goodbye, say a short farewell. ")
+_OP_PTT = ("HOW YOU WORK (state this accurately — NEVER invent features): you are in PUSH-TO-TALK mode. The user "
+           "presses ENTER, then speaks; you reply when they pause. In THIS mode there is no wake word. There is "
+           "also a hands-free WAKE-WORD mode the user can start with Start_VOX_HeyVox.bat, where the wake word is "
+           "'Hey Vox'. There is no settings/voice-activation menu. If asked how to talk to you now, say: press "
+           "ENTER then speak (type q then ENTER to quit). If you don't know something about your own app, say so. ")
+_OP_WAKE = ("HOW YOU WORK (state this accurately — NEVER invent features): you are in HANDS-FREE WAKE-WORD mode. "
+            "The user says 'Hey Vox' followed by their request and you answer; if they say only 'Hey Vox', ask "
+            "what they need. The wake word IS 'Hey Vox'. There is also a push-to-talk mode (press ENTER). There is "
+            "no settings menu. If you don't know something about your own app, say so plainly instead of guessing. ")
+_NAMES = ("You are part of Leslie Moody's AI team; Leslie is your creator (he/him) — refer to him as he/him. "
+          "Friday is the command-line voice assistant — always address her as Friday. Jarvis is Leslie's main "
+          "voice assistant — always address him as Jarvis. Use these names whenever you speak to or about them.")
+SYSTEM = _PERSONA + _OP_PTT + _NAMES          # push-to-talk / text / test modes
+SYSTEM_WAKE = _PERSONA + _OP_WAKE + _NAMES    # hands-free wake-word mode
 
 
 def _groq_key() -> str:
@@ -252,6 +269,51 @@ def run_test():
     print(f"   → saved reply audio: {rwav}")
     print("\n✅ Full pipeline works: audio→text→LLM+tools→text→audio.")
 
+def _wake_match(text: str):
+    """If the utterance begins with the wake word ('Hey Vox', tolerant of Whisper mishearings),
+    return the command that follows it (possibly ''). Otherwise return None so it's ignored."""
+    words = re.sub(r"[^a-z0-9' ]", " ", text.lower()).split()
+    greet = {"hey", "hi", "ok", "okay", "yo", "hello", "hay", "a"}
+    for i in range(min(4, len(words))):        # only near the start, so mid-sentence look-alikes don't trigger
+        if words[i] in _WAKE_ALTS and (i == 0 or words[i - 1] in greet):
+            return " ".join(words[i + 1:]).strip()
+    return None
+
+
+def run_wake(device=None):
+    """Hands-free WAKE-WORD mode: always listening, but only ACTS after it hears 'Hey Vox'."""
+    hist = [{"role": "system", "content": SYSTEM_WAKE}]
+    print(f'🎙️  VOX is live (hands-free). Say "{WAKE}" to wake me, then your question.')
+    print('   ▶ e.g. "Hey Vox, what time is it?"    ▶ say "Hey Vox, goodbye" to exit.    ▶ Ctrl+C to stop.\n')
+    say(f"Hands-free mode on. Say {WAKE}, then your question.", bargein=False)
+    while True:
+        wav = record_utterance(device=device, start_timeout=3600)   # wait for any speech
+        if not wav:
+            continue
+        text = transcribe(wav); os.remove(wav)
+        if not text:
+            continue
+        cmd = _wake_match(text)
+        if cmd is None:
+            continue                     # not addressed to me — stay quiet (the whole point of a wake word)
+        print(f'👂 wake heard: "{text}"')
+        if not cmd:                      # they said only the wake word — ask what they need
+            say("Yes?", bargein=False)
+            wav2 = record_utterance(device=device, start_timeout=8)
+            cmd = transcribe(wav2) if wav2 else ""
+            if wav2:
+                os.remove(wav2)
+            if not cmd:
+                print("… (didn't catch the request — say the wake word again)\n"); continue
+        print(f"👤 you: {cmd}")
+        hist.append({"role": "user", "content": cmd})
+        reply, hist = think(hist)
+        say(reply, bargein=True)
+        print()
+        if re.search(r"\b(goodbye|good night|stop listening|that's all|we're done)\b", cmd, re.I):
+            say("Talk soon."); break
+
+
 def run_live(device=None, hands_free=False):
     hist = [{"role": "system", "content": SYSTEM}]
     if hands_free:
@@ -307,7 +369,8 @@ def main():
     ap.add_argument("--test", action="store_true", help="run the no-mic pipeline self-test")
     ap.add_argument("--devices", action="store_true", help="list microphone devices and exit")
     ap.add_argument("--device", type=int, default=None, help="input device number (see --devices)")
-    ap.add_argument("--hands-free", action="store_true", help="always-listening mode (quiet rooms only)")
+    ap.add_argument("--hands-free", action="store_true", help="always-listening mode (responds to any speech)")
+    ap.add_argument("--wake", action="store_true", help="hands-free WAKE-WORD mode — say 'Hey Vox' to talk")
     a = ap.parse_args()
     try:
         if a.devices:
@@ -316,6 +379,8 @@ def main():
             run_test()
         elif a.text:
             run_text(a.text)
+        elif a.wake:
+            run_wake(device=a.device)
         else:
             run_live(device=a.device, hands_free=a.hands_free)
     except KeyboardInterrupt:
