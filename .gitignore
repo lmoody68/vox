@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 *.wav
 .env
+# ECAPA speaker model (~85MB) — auto-downloads on first --enroll
+models/
+# YOUR biometric voiceprint — personal, never commit
+voiceprint.npy

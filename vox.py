@@ -12,12 +12,14 @@ turn-based Voice Hub is missing. STT = SCRIBE's Whisper. LLM = your Groq key. TT
 Modes:
     python vox.py                 # PUSH-TO-TALK (default) — press ENTER, then speak (Start_VOX.bat)
     python vox.py --wake          # HANDS-FREE wake word — say "Hey Vox" then your question (Start_VOX_HeyVox.bat)
+    python vox.py --enroll        # record YOUR voiceprint so wake mode only answers you (ignores TV/others)
     python vox.py --hands-free    # always-listening — responds to ANY speech (quiet rooms only)
     python vox.py --text "hi"     # feed text → LLM(+tools) → speak the reply (no mic)
     python vox.py --test          # full pipeline self-test: TTS a question → STT it → LLM → TTS reply
                                   #   (proves every stage without a mic)
 
 Deps: faster-whisper edge-tts sounddevice soundfile webrtcvad-wheels pydub imageio-ffmpeg numpy
+      speechbrain torch torchaudio      # (optional) voiceprint speaker verification for --enroll / --wake
 """
 from __future__ import annotations
 import argparse, ast, asyncio, datetime, json, os, re, sys, tempfile, threading, time, urllib.request
@@ -39,6 +41,12 @@ WAKE = os.getenv("VOX_WAKE", "Hey Vox")               # wake phrase for hands-fr
 # Whisper (base.en) often mishears 'Vox' — accept these look-alikes as the wake token.
 _WAKE_ALTS = ("vox", "box", "fox", "vaux", "volks", "folks", "walks", "vaults", "vault",
               "vocs", "vex", "bucks", "vaux", "vaughs", "faux", "vox's")
+
+# ── voiceprint (optional speaker verification — only answer the enrolled owner, ignore TV/other people) ──
+VOICEPRINT_PATH = os.path.join(HERE, "voiceprint.npy")     # enrolled owner embedding (created by --enroll)
+ECAPA_DIR = os.path.join(HERE, "models", "ecapa")          # local cache of the ECAPA-TDNN speaker model
+VERIFY_THRESHOLD = float(os.getenv("VOX_VOICEPRINT_THRESHOLD", "0.55"))  # cosine cutoff (same-speaker >0.7, others <0.35)
+_encoder = None                                            # cached ECAPA encoder (False = tried and unavailable)
 
 _PERSONA = ("You are Vox, a friendly, concise voice assistant. Your name is Vox — always write and say it as a "
             "single word (Vox), never spell it out. Keep replies to 1-2 sentences — you are being spoken aloud. "
@@ -150,6 +158,109 @@ def warm_stt():
     if _stt is None:
         from faster_whisper import WhisperModel
         _stt = WhisperModel(STT_MODEL, device="cpu", compute_type="int8")
+
+
+# ── voiceprint speaker verification (ECAPA-TDNN) — only respond to the enrolled owner ─────────────────
+def _get_encoder():
+    """Load the ECAPA speaker encoder once (offline after the first download). None if unavailable."""
+    global _encoder
+    if _encoder is not None:
+        return _encoder or None
+    try:
+        from speechbrain.inference.speaker import EncoderClassifier
+        from speechbrain.utils.fetching import LocalStrategy      # COPY: Windows blocks symlinks w/o admin
+        src = ECAPA_DIR if os.path.exists(os.path.join(ECAPA_DIR, "hyperparams.yaml")) \
+            else "speechbrain/spkrec-ecapa-voxceleb"
+        _encoder = EncoderClassifier.from_hparams(source=src, savedir=ECAPA_DIR,
+                                                  run_opts={"device": "cpu"}, local_strategy=LocalStrategy.COPY)
+    except Exception as e:
+        print(f"   (voiceprint model unavailable: {e} — verification skipped)")
+        _encoder = False
+    return _encoder or None
+
+
+def embed_wav(wav_path):
+    """Return a normalised ECAPA embedding (np.float32) for a 16k-mono wav, or None if it can't be made."""
+    enc = _get_encoder()
+    if enc is None:
+        return None
+    try:
+        import soundfile as sf, torch
+        data, sr = sf.read(wav_path, dtype="float32")
+        if data.ndim > 1:
+            data = data.mean(1)
+        if len(data) < SR // 4:                          # need at least ~0.25s of audio
+            return None
+        wav = torch.from_numpy(np.ascontiguousarray(data)).unsqueeze(0)
+        with torch.no_grad():
+            e = enc.encode_batch(wav).squeeze()
+        e = e / e.norm()
+        return e.cpu().numpy().astype(np.float32)
+    except Exception:
+        return None
+
+
+def load_voiceprint():
+    """Return the saved owner embedding (normalised), or None if not enrolled."""
+    if not os.path.exists(VOICEPRINT_PATH):
+        return None
+    try:
+        vp = np.load(VOICEPRINT_PATH).astype(np.float32)
+        n = float(np.linalg.norm(vp))
+        return vp / n if n else None
+    except Exception:
+        return None
+
+
+def verify_speaker(wav_path):
+    """(ok, score). Not enrolled -> (True, -1). Can't embed -> (True, -2) (fail-open so VOX still works)."""
+    vp = load_voiceprint()
+    if vp is None:
+        return True, -1.0
+    emb = embed_wav(wav_path)
+    if emb is None:
+        return True, -2.0
+    score = float(np.dot(emb, vp))
+    return score >= VERIFY_THRESHOLD, score
+
+
+def run_enroll(device=None, samples=5):
+    """Record several utterances and save YOUR voiceprint, so wake mode ignores the TV and other people."""
+    print("\n🔒 VOX voiceprint enrollment — teach VOX your voice so it only listens to you.")
+    if _get_encoder() is None:
+        print("   Speaker model unavailable — cannot enroll.  (Fix:  pip install speechbrain)\n"); return
+    warm_stt()
+    phrases = [
+        "Hey Vox, what's on my calendar today?",
+        "Hey Vox, set a timer for ten minutes please.",
+        "The quick brown fox jumps over the lazy dog.",
+        "Hey Vox, what's the weather like this afternoon?",
+        "I am enrolling my voice so you only listen to me.",
+    ]
+    embs, i = [], 0
+    while len(embs) < samples:
+        phrase = phrases[i % len(phrases)]
+        i += 1
+        print(f'\n   [{len(embs)+1}/{samples}]  Say, clearly:  "{phrase}"')
+        try:
+            input("   Press ENTER, then speak… ")
+        except EOFError:
+            pass
+        wav = record_utterance(device=device, start_timeout=8, max_sec=8)
+        if not wav:
+            print("   (heard nothing — let's redo that one)"); continue
+        emb = embed_wav(wav); os.remove(wav)
+        if emb is None:
+            print("   (couldn't read that clearly — redo)"); continue
+        embs.append(emb); print("   ✓ got it")
+    vp = np.mean(np.stack(embs), axis=0)
+    vp = vp / np.linalg.norm(vp)
+    sims = [float(np.dot(a, b)) for x, a in enumerate(embs) for b in embs[x + 1:]]
+    consistency = sum(sims) / len(sims) if sims else 0.0
+    np.save(VOICEPRINT_PATH, vp.astype(np.float32))
+    print(f"\n   🔒 Saved your voiceprint → {VOICEPRINT_PATH}")
+    print(f"   Sample self-consistency: {consistency:.2f}   ·   match threshold: {VERIFY_THRESHOLD:.2f} (others score <0.35)")
+    print("   Wake mode now responds ONLY to your voice. (Delete voiceprint.npy to turn this off.)\n")
 
 
 # ── TTS (edge-tts → mp3 → PCM via bundled ffmpeg) ───────────────────────────────────────────────────
@@ -320,6 +431,11 @@ def run_wake(device=None):
         print(f"   (listening on mic: {name}  — if that's wrong, run with  --device N ; see  python vox.py --devices)\n")
     except Exception as e:
         print(f"   (could not read mic device: {e})\n")
+    if load_voiceprint() is not None:
+        _get_encoder()                       # warm the speaker model so the first verification isn't slow
+        print(f"   🔒 Voiceprint ON — I'll only respond to YOUR enrolled voice (match ≥ {VERIFY_THRESHOLD:.2f}).\n")
+    else:
+        print("   🔓 Voiceprint off — I respond to any voice.  Lock to yours:  python vox.py --enroll\n")
     say(f"Hands-free mode on. Say {WAKE}, then your question.", bargein=False)
     while True:
         print("… listening (say \"Hey Vox …\")")
@@ -330,21 +446,32 @@ def run_wake(device=None):
             os.remove(wav)
             print(f"   (ignored background — volume {int(_last_rms)} below {WAKE_MIN_RMS}; speak toward the mic)")
             continue
-        text = transcribe(wav); os.remove(wav)
+        text = transcribe(wav)
         if not text:
+            os.remove(wav)
             print("   (heard sound but no words — mic may be too quiet or the wrong device)")
             continue
         cmd = _wake_match(text)
         if cmd is None:
+            os.remove(wav)
             print(f'   (heard: "{text}" [vol {int(_last_rms)}] — not the wake word; say "Hey Vox" first)')
             continue
-        print(f'👂 wake heard: "{text}"')
+        ok, score = verify_speaker(wav); os.remove(wav)   # wake word matched — but is it the owner's voice?
+        if not ok:
+            print(f'   (ignored "{text}" — not your enrolled voice; match {score:.2f} < {VERIFY_THRESHOLD:.2f})')
+            continue
+        print(f'👂 wake heard: "{text}"' + (f'  [you ✓ {score:.2f}]' if score >= 0 else ''))
         if not cmd:                      # they said only the wake word — ask what they need
             say("Yes?", bargein=False)
             wav2 = record_utterance(device=device, start_timeout=8)
-            cmd = transcribe(wav2) if wav2 else ""
             if wav2:
+                ok2, _ = verify_speaker(wav2)             # verify the follow-up too, so the TV can't answer "Yes?"
+                cmd = transcribe(wav2) if ok2 else ""
                 os.remove(wav2)
+                if not ok2:
+                    print("… (that follow-up wasn't your voice — say the wake word again)\n"); continue
+            else:
+                cmd = ""
             if not cmd:
                 print("… (didn't catch the request — say the wake word again)\n"); continue
         print(f"👤 you: {cmd}")
@@ -416,10 +543,13 @@ def main():
     ap.add_argument("--device", type=int, default=None, help="input device number (see --devices)")
     ap.add_argument("--hands-free", action="store_true", help="always-listening mode (responds to any speech)")
     ap.add_argument("--wake", action="store_true", help="hands-free WAKE-WORD mode — say 'Hey Vox' to talk")
+    ap.add_argument("--enroll", action="store_true", help="record your voiceprint so wake mode only answers YOU")
     a = ap.parse_args()
     try:
         if a.devices:
             list_devices()
+        elif a.enroll:
+            run_enroll(device=a.device)
         elif a.test:
             run_test()
         elif a.text:
