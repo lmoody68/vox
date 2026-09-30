@@ -142,6 +142,14 @@ def transcribe(wav_path):
     return " ".join(s.text.strip() for s in segs).strip()
 
 
+def warm_stt():
+    """Load Whisper up front so the FIRST turn isn't slowed by the ~1s cold model load."""
+    global _stt
+    if _stt is None:
+        from faster_whisper import WhisperModel
+        _stt = WhisperModel(STT_MODEL, device="cpu", compute_type="int8")
+
+
 # ── TTS (edge-tts → mp3 → PCM via bundled ffmpeg) ───────────────────────────────────────────────────
 def _tts_prep(text):
     """Normalize text so it's spoken naturally: say names as words (not spelled), fix run-together sentences."""
@@ -157,7 +165,13 @@ def synth(text):
     ff = imageio_ffmpeg.get_ffmpeg_exe()
     mp3 = os.path.join(tempfile.gettempdir(), f"vox_{int(time.time()*1000)}.mp3")
     async def _go():
-        await edge_tts.Communicate(text, VOICE).save(mp3)
+        last = None
+        for _ in range(2):                              # retry once on a network hiccup (reliability)
+            try:
+                await edge_tts.Communicate(text, VOICE).save(mp3); return
+            except Exception as e:
+                last = e; await asyncio.sleep(0.4)
+        raise last
     asyncio.run(_go())
     cmd = [ff, "-nostdin", "-loglevel", "quiet", "-i", mp3,
            "-f", "f32le", "-acodec", "pcm_f32le", "-ac", "1", "-ar", str(TTS_SR), "pipe:1"]
@@ -229,7 +243,7 @@ def play_simple(pcm, sr):
 def say(text, do_play=True, bargein=False, tag="VOX"):
     print(f"🔊 {tag}: {text}")
     if do_play:
-        pcm, sr = synth(text)
+        pcm, sr = synth(text)                         # .save()+decode is the fastest path for short replies
         if bargein:
             return play_with_bargein(pcm, sr)
         play_simple(pcm, sr)
@@ -292,6 +306,7 @@ def _wake_match(text: str):
 def run_wake(device=None):
     """Hands-free WAKE-WORD mode: always listening, but only ACTS after it hears 'Hey Vox'."""
     hist = [{"role": "system", "content": SYSTEM_WAKE}]
+    warm_stt()                                    # pre-load Whisper so the first turn isn't slow
     print(f'🎙️  VOX is live (hands-free). Say "{WAKE}" to wake me, then your question.')
     print('   ▶ e.g. "Hey Vox, what time is it?"    ▶ say "Hey Vox, goodbye" to exit.    ▶ Ctrl+C to stop.')
     try:
@@ -337,6 +352,7 @@ def run_wake(device=None):
 
 def run_live(device=None, hands_free=False):
     hist = [{"role": "system", "content": SYSTEM}]
+    warm_stt()                                    # pre-load Whisper so the first turn isn't slow
     if hands_free:
         # always-listening (only good in a quiet room — picks up ANY speech, incl. TV/other people)
         print("🎙️  VOX is live (hands-free). Speak anytime; talk over me to interrupt. Say \"goodbye\" to exit.\n")
