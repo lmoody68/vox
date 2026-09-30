@@ -11,7 +11,7 @@ turn-based Voice Hub is missing. STT = SCRIBE's Whisper. LLM = your Groq key. TT
 
 Modes:
     python vox.py                 # PUSH-TO-TALK (default) — press ENTER, then speak (Start_VOX.bat)
-    python vox.py --wake          # HANDS-FREE wake word — say "Hey Vox" then your question (Start_VOX_HeyVox.bat)
+    python vox.py --wake          # HANDS-FREE — say "Hey Vox" once, then converse freely (Start_VOX_HeyVox.bat)
     python vox.py --enroll        # record YOUR voiceprint so wake mode only answers you (ignores TV/others)
     python vox.py --hands-free    # always-listening — responds to ANY speech (quiet rooms only)
     python vox.py --text "hi"     # feed text → LLM(+tools) → speak the reply (no mic)
@@ -38,6 +38,8 @@ FRAME = SR * FRAME_MS // 1000  # 320 samples/frame
 WAKE_MIN_RMS = int(os.getenv("VOX_MIN_RMS", "450"))   # ignore background quieter than this (near-field gate)
 _last_rms = 0.0               # loudness of the most recent utterance (for the near-field/background gate)
 WAKE = os.getenv("VOX_WAKE", "Hey Vox")               # wake phrase for hands-free mode
+CONV_WINDOW = float(os.getenv("VOX_CONV_WINDOW", "12"))  # after a reply, keep listening this long for a follow-up
+                                                      # with NO wake word (0 = off; voiceprint still gates each turn)
 # Whisper (base.en) often mishears 'Vox' — accept these look-alikes as the wake token.
 _WAKE_ALTS = ("vox", "box", "fox", "vaux", "volks", "folks", "walks", "vaults", "vault",
               "vocs", "vex", "bucks", "vaux", "vaughs", "faux", "vox's")
@@ -480,12 +482,36 @@ def _wake_match(text: str):
     return None
 
 
+def _verified_followup(device, window):
+    """Conversation mode: after a reply, listen (NO wake word needed) for the enrolled OWNER to keep talking,
+    within `window` seconds. Returns the next command text, or None if the window passes with no owner speech."""
+    deadline = time.time() + window
+    while time.time() < deadline:
+        wait = max(0.6, deadline - time.time())
+        wav = record_utterance(device=device, start_timeout=wait)
+        if not wav:
+            return None                                  # nobody spoke in the window → end the conversation
+        if WAKE_MIN_RMS and _last_rms < WAKE_MIN_RMS:    # distant background — ignore, keep the window open
+            os.remove(wav); continue
+        text = transcribe(wav)
+        ok, score, thr = verify_speaker(wav); os.remove(wav)
+        if not text:
+            continue
+        if not ok:                                       # someone/something else spoke — ignore, keep listening
+            print(f'   (ignored "{text}" — not your voice; {score:.2f} < {thr:.2f})')
+            continue
+        stripped = _wake_match(text)                     # a stray "Hey Vox" prefix is fine but not required now
+        return stripped if stripped else text
+    return None
+
+
 def run_wake(device=None):
-    """Hands-free WAKE-WORD mode: always listening, but only ACTS after it hears 'Hey Vox'."""
+    """Hands-free WAKE-WORD mode: say 'Hey Vox' to start, then converse freely (voiceprint gates every turn)."""
     hist = [{"role": "system", "content": SYSTEM_WAKE}]
     warm_stt()                                    # pre-load Whisper so the first turn isn't slow
-    print(f'🎙️  VOX is live (hands-free). Say "{WAKE}" to wake me, then your question.')
-    print('   ▶ e.g. "Hey Vox, what time is it?"    ▶ say "Hey Vox, goodbye" to exit.    ▶ Ctrl+C to stop.')
+    print(f'🎙️  VOX is live (hands-free). Say "{WAKE}" once, then just keep talking — no wake word for follow-ups.')
+    conv = f'conversation stays open ~{int(CONV_WINDOW)}s after each reply' if CONV_WINDOW > 0 else 'follow-up window off'
+    print(f'   ▶ e.g. "Hey Vox, what time is it?"   ▶ {conv}   ▶ say "goodbye" or Ctrl+C to stop.')
     try:
         import sounddevice as sd
         di = device if device is not None else (sd.default.device[0] if sd.default.device[0] not in (None, -1) else None)
@@ -500,7 +526,9 @@ def run_wake(device=None):
               f"short commands pass on proximity).\n")
     else:
         print("   🔓 Voiceprint off — I respond to any voice.  Lock to yours:  python vox.py --enroll\n")
-    say(f"Hands-free mode on. Say {WAKE}, then your question.", bargein=False)
+    greeting = (f"Hands-free mode on. Say {WAKE}, then just keep talking — I'll stay with you between questions."
+                if CONV_WINDOW > 0 else f"Hands-free mode on. Say {WAKE}, then your question.")
+    say(greeting, bargein=False)
     while True:
         print("… listening (say \"Hey Vox …\")")
         wav = record_utterance(device=device, start_timeout=3600)   # wait for any speech
@@ -539,15 +567,24 @@ def run_wake(device=None):
                 cmd = ""
             if not cmd:
                 print("… (didn't catch the request — say the wake word again)\n"); continue
-        print(f"👤 you: {cmd}")
-        hist.append({"role": "user", "content": cmd})
-        reply, hist = think(hist)
-        # bargein=False: with speakers, an open mic hears VOX's OWN voice and self-interrupts. Replies are
-        # short (1-2 sentences), so play them fully. (Barge-in needs a headset to avoid the echo.)
-        say(reply, bargein=False)
-        print()
-        if re.search(r"\b(goodbye|good night|stop listening|that's all|we're done)\b", cmd, re.I):
-            say("Talk soon."); break
+        # --- respond, then stay in an OPEN conversation (no wake word needed) until you pause ---
+        while True:
+            print(f"👤 you: {cmd}")
+            hist.append({"role": "user", "content": cmd})
+            reply, hist = think(hist)
+            # bargein=False: an open mic hears VOX's OWN voice on the speakers and self-interrupts. Replies are
+            # short (1-2 sentences), so play them fully. (Barge-in needs a headset to avoid the echo.)
+            say(reply, bargein=False)
+            print()
+            if re.search(r"\b(goodbye|good night|stop listening|that's all|we're done)\b", cmd, re.I):
+                say("Talk soon."); return
+            if CONV_WINDOW <= 0:
+                break                                    # conversation window disabled → back to the wake word
+            print(f'… (still here — just keep talking; pause ~{int(CONV_WINDOW)}s and I\'ll wait for "{WAKE}")')
+            cmd = _verified_followup(device, CONV_WINDOW)
+            if not cmd:
+                print(f'   (going quiet — say "{WAKE}" to wake me)\n')
+                break
 
 
 def run_live(device=None, hands_free=False):
