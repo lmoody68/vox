@@ -286,18 +286,28 @@ def run_wake(device=None):
     """Hands-free WAKE-WORD mode: always listening, but only ACTS after it hears 'Hey Vox'."""
     hist = [{"role": "system", "content": SYSTEM_WAKE}]
     print(f'🎙️  VOX is live (hands-free). Say "{WAKE}" to wake me, then your question.')
-    print('   ▶ e.g. "Hey Vox, what time is it?"    ▶ say "Hey Vox, goodbye" to exit.    ▶ Ctrl+C to stop.\n')
+    print('   ▶ e.g. "Hey Vox, what time is it?"    ▶ say "Hey Vox, goodbye" to exit.    ▶ Ctrl+C to stop.')
+    try:
+        import sounddevice as sd
+        di = device if device is not None else (sd.default.device[0] if sd.default.device[0] not in (None, -1) else None)
+        name = sd.query_devices(di)["name"] if di is not None else sd.query_devices(kind="input")["name"]
+        print(f"   (listening on mic: {name}  — if that's wrong, run with  --device N ; see  python vox.py --devices)\n")
+    except Exception as e:
+        print(f"   (could not read mic device: {e})\n")
     say(f"Hands-free mode on. Say {WAKE}, then your question.", bargein=False)
     while True:
+        print("… listening (say \"Hey Vox …\")")
         wav = record_utterance(device=device, start_timeout=3600)   # wait for any speech
         if not wav:
             continue
         text = transcribe(wav); os.remove(wav)
         if not text:
+            print("   (heard sound but no words — mic may be too quiet or the wrong device)")
             continue
         cmd = _wake_match(text)
         if cmd is None:
-            continue                     # not addressed to me — stay quiet (the whole point of a wake word)
+            print(f'   (heard: "{text}" — not the wake word; say "Hey Vox" first)')
+            continue
         print(f'👂 wake heard: "{text}"')
         if not cmd:                      # they said only the wake word — ask what they need
             say("Yes?", bargein=False)
