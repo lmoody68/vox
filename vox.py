@@ -22,7 +22,7 @@ Deps: faster-whisper edge-tts sounddevice soundfile webrtcvad-wheels pydub image
       speechbrain torch torchaudio      # (optional) voiceprint speaker verification for --enroll / --wake
 """
 from __future__ import annotations
-import argparse, ast, asyncio, datetime, json, os, re, sys, tempfile, threading, time, urllib.request
+import argparse, ast, asyncio, datetime, json, os, re, sys, tempfile, threading, time, urllib.error, urllib.request
 
 import numpy as np
 
@@ -55,7 +55,11 @@ _last_speech_sec = 0.0                                     # voiced-speech durat
 
 _PERSONA = ("You are Vox, a friendly, concise voice assistant. Your name is Vox — always write and say it as a "
             "single word (Vox), never spell it out. Keep replies to 1-2 sentences — you are being spoken aloud. "
-            "Use tools when they help. If the user says goodbye, say a short farewell. ")
+            "Use tools when they help. If the user says goodbye, say a short farewell. "
+            "You can CONTROL Les's real web browser to carry out tasks — open a page, read what's on it, click, "
+            "type, run a bit of JavaScript — using the web_ tools. When asked to do something on the web, "
+            "actually DO it step by step: open the site, read the page to see what's there, then click/type as "
+            "needed, and tell Les what you found or did. Don't claim you can't browse — you can. ")
 _OP_PTT = ("HOW YOU WORK (state this accurately — NEVER invent features): you are in PUSH-TO-TALK mode. The user "
            "presses ENTER, then speaks; you reply when they pause. In THIS mode there is no wake word. There is "
            "also a hands-free WAKE-WORD mode the user can start with Start_VOX_HeyVox.bat, where the wake word is "
@@ -122,22 +126,61 @@ TOOLS_SPEC = [
     {"type": "function", "function": {"name": "calculate", "description": "Evaluate a math expression.",
         "parameters": {"type": "object", "properties": {"expression": {"type": "string"}}, "required": ["expression"]}}},
 ]
+MAX_TOOL_HOPS = int(os.getenv("VOX_MAX_TOOL_HOPS", "10"))   # tool-loop iterations (browser tasks are multi-step)
+
+
+def _load_shared_skills():
+    """Merge JARVIS's shared skills (skills/registry.py — VEIL browser, mail, calendar…) into VOX's tool
+    surface, so VOX shares ONE capability set with Friday/JARVIS/the duet. Fail-open: if the JARVIS tree
+    isn't importable, VOX keeps its built-in tools and runs normally."""
+    home = os.getenv("JARVIS_HOME", r"C:\Users\lesli\Documents\JARVIS")
+    if home not in sys.path:
+        sys.path.insert(0, home)
+    try:
+        from skills import registry
+    except Exception as e:
+        print(f"   (shared skills unavailable: {e} — VOX runs with built-in tools only)")
+        return
+    TOOLS_SPEC.extend(registry.OPENAI_TOOLS)
+    for _nm in registry.NAMES:
+        TOOLS_IMPL[_nm] = (lambda n: (lambda a: registry.dispatch(n, a)))(_nm)
+    print(f"   🧩 shared skills loaded: {', '.join(registry.NAMES)}")
+
+
+_load_shared_skills()
 
 
 # ── LLM (Groq, OpenAI-compatible, with tool loop) ───────────────────────────────────────────────────
 def _chat(messages):
     payload = json.dumps({"model": LLM_MODEL, "messages": messages, "tools": TOOLS_SPEC,
                           "tool_choice": "auto", "temperature": 0.4, "max_tokens": 300}).encode()
-    req = urllib.request.Request(LLM_BASE.rstrip("/") + "/chat/completions", data=payload,
-        headers={"Authorization": f"Bearer {_groq_key()}", "Content-Type": "application/json",
-                 "User-Agent": "curl/8.5.0"})   # UA avoids Cloudflare 1010 in front of Groq
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read().decode())["choices"][0]["message"]
+    last = None
+    for attempt in range(3):                              # Groq occasionally 400s/429s a valid payload — retry
+        try:
+            req = urllib.request.Request(LLM_BASE.rstrip("/") + "/chat/completions", data=payload,
+                headers={"Authorization": f"Bearer {_groq_key()}", "Content-Type": "application/json",
+                         "User-Agent": "curl/8.5.0"})     # UA avoids Cloudflare 1010 in front of Groq
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read().decode())["choices"][0]["message"]
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code in (400, 429, 500, 502, 503, 504) and attempt < 2:
+                time.sleep(0.5 * (attempt + 1)); continue
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last = e
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1)); continue
+            raise
+    raise last
 
 def think(history):
     """Run the tool-calling loop; return (reply_text, updated_history)."""
-    for _ in range(4):
-        msg = _chat(history)
+    for _ in range(MAX_TOOL_HOPS):
+        try:
+            msg = _chat(history)
+        except Exception:
+            return "I hit a snag reaching my brain just now — give me another try in a second.", history
         history.append(msg)
         calls = msg.get("tool_calls")
         if not calls:
