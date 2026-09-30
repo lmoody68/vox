@@ -553,14 +553,11 @@ def _verified_followup(device, window):
 
 # ── agent mesh: let other agents (JARVIS / Friday / Claude) hand VOX a task ──────────────────────────
 def _handle_agent_task(task: str, who: str = "an agent") -> str:
-    """Run a task another agent handed to VOX, speak the result so Les hears the hand-off, and return it."""
+    """Run a task another agent handed to VOX and return the result (the ASKING agent speaks it, so VOX
+    stays silent here to avoid two voices talking over each other)."""
     print(f"\n📨 {who} → VOX: {task}")
     reply, _ = think([{"role": "system", "content": SYSTEM}, {"role": "user", "content": task}])
-    try:
-        say(f"{who} asked me to handle that. {reply}", bargein=False)
-    except Exception:
-        pass
-    print(f"🔊 VOX → {who}: {reply}\n")
+    print(f"↩️  VOX → {who}: {reply}\n")
     return reply
 
 
@@ -743,6 +740,22 @@ def run_live(device=None, hands_free=False):
             say("Talk soon."); break
 
 
+def run_serve():
+    """Mesh-worker mode: run ONLY the agent-listener (no mic), so other agents can task VOX while the Voice
+    Hub owns the microphone. Ctrl+C to stop."""
+    print('🤝 VOX mesh worker — listener only (no mic; the Voice Hub owns it).')
+    srv = _start_agent_listener()
+    if not srv:
+        print("   couldn't start the listener (is the port already in use?). Exiting.")
+        return
+    print("   Ready — JARVIS / Friday / Claude can hand me tasks now.  Ctrl+C to stop.\n")
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        print("\n👋 VOX mesh worker stopped.")
+
+
 def main():
     ap = argparse.ArgumentParser(description="VOX — local streaming voice agent")
     ap.add_argument("--text", help="feed text instead of the mic")
@@ -752,10 +765,13 @@ def main():
     ap.add_argument("--hands-free", action="store_true", help="always-listening mode (responds to any speech)")
     ap.add_argument("--wake", action="store_true", help="hands-free WAKE-WORD mode — say 'Hey Vox' to talk")
     ap.add_argument("--enroll", action="store_true", help="record your voiceprint so wake mode only answers YOU")
+    ap.add_argument("--serve", action="store_true", help="mesh-worker mode: listener only (no mic) so other agents can task VOX")
     a = ap.parse_args()
     try:
         if a.devices:
             list_devices()
+        elif a.serve:
+            run_serve()
         elif a.enroll:
             run_enroll(device=a.device)
         elif a.test:
