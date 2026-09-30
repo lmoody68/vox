@@ -40,6 +40,8 @@ _last_rms = 0.0               # loudness of the most recent utterance (for the n
 WAKE = os.getenv("VOX_WAKE", "Hey Vox")               # wake phrase for hands-free mode
 CONV_WINDOW = float(os.getenv("VOX_CONV_WINDOW", "12"))  # after a reply, keep listening this long for a follow-up
                                                       # with NO wake word (0 = off; voiceprint still gates each turn)
+VOX_LISTEN_PORT = int(os.getenv("VOX_LISTEN_PORT", "8799"))   # loopback port the other agents reach VOX on
+VOX_LISTEN_TOKEN = os.getenv("VOX_LISTEN_TOKEN") or os.getenv("JARVIS_RELAY_TOKEN", "")  # shared mesh token
 # Whisper (base.en) often mishears 'Vox' — accept these look-alikes as the wake token.
 _WAKE_ALTS = ("vox", "box", "fox", "vaux", "volks", "folks", "walks", "vaults", "vault",
               "vocs", "vex", "bucks", "vaux", "vaughs", "faux", "vox's")
@@ -136,6 +138,7 @@ def _load_shared_skills():
     home = os.getenv("JARVIS_HOME", r"C:\Users\lesli\Documents\JARVIS")
     if home not in sys.path:
         sys.path.insert(0, home)
+    os.environ.setdefault("AGENT_NAME", "VOX")    # so ask_agent tells the callee that VOX is asking
     try:
         from skills import registry
     except Exception as e:
@@ -548,10 +551,69 @@ def _verified_followup(device, window):
     return None
 
 
+# ── agent mesh: let other agents (JARVIS / Friday / Claude) hand VOX a task ──────────────────────────
+def _handle_agent_task(task: str, who: str = "an agent") -> str:
+    """Run a task another agent handed to VOX, speak the result so Les hears the hand-off, and return it."""
+    print(f"\n📨 {who} → VOX: {task}")
+    reply, _ = think([{"role": "system", "content": SYSTEM}, {"role": "user", "content": task}])
+    try:
+        say(f"{who} asked me to handle that. {reply}", bargein=False)
+    except Exception:
+        pass
+    print(f"🔊 VOX → {who}: {reply}\n")
+    return reply
+
+
+def _start_agent_listener():
+    """Loopback HTTP server so other agents can task VOX: POST /task {task, from} -> {ok, reply}. Token-gated."""
+    import http.server
+    tok = VOX_LISTEN_TOKEN
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, obj):
+            b = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+        def do_POST(self):
+            if tok and self.headers.get("X-Vox-Token") != tok:
+                return self._send(401, {"ok": False, "error": "bad token"})
+            try:
+                n = int(self.headers.get("Content-Length", "0"))
+                data = json.loads(self.rfile.read(n) or b"{}")
+            except Exception:
+                return self._send(400, {"ok": False, "error": "bad json"})
+            task = (data.get("task") or "").strip()
+            who = data.get("from", "an agent")
+            if not task:
+                return self._send(400, {"ok": False, "error": "no task"})
+            try:
+                self._send(200, {"ok": True, "reply": _handle_agent_task(task, who)})
+            except Exception as e:
+                self._send(500, {"ok": False, "error": str(e)})
+
+    try:
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", VOX_LISTEN_PORT), _H)
+    except OSError as e:
+        print(f"   (VOX agent-listener not started on :{VOX_LISTEN_PORT} — {e})")
+        return None
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    print(f"   📡 VOX is addressable by other agents on 127.0.0.1:{VOX_LISTEN_PORT}"
+          + ("" if tok else "  (⚠️ no token — loopback only)"))
+    return srv
+
+
 def run_wake(device=None):
     """Hands-free WAKE-WORD mode: say 'Hey Vox' to start, then converse freely (voiceprint gates every turn)."""
     hist = [{"role": "system", "content": SYSTEM_WAKE}]
     warm_stt()                                    # pre-load Whisper so the first turn isn't slow
+    _start_agent_listener()                       # let JARVIS/Friday/Claude hand VOX tasks
     print(f'🎙️  VOX is live (hands-free). Say "{WAKE}" once, then just keep talking — no wake word for follow-ups.')
     conv = f'conversation stays open ~{int(CONV_WINDOW)}s after each reply' if CONV_WINDOW > 0 else 'follow-up window off'
     print(f'   ▶ e.g. "Hey Vox, what time is it?"   ▶ {conv}   ▶ say "goodbye" or Ctrl+C to stop.')
@@ -633,6 +695,7 @@ def run_wake(device=None):
 def run_live(device=None, hands_free=False):
     hist = [{"role": "system", "content": SYSTEM}]
     warm_stt()                                    # pre-load Whisper so the first turn isn't slow
+    _start_agent_listener()                       # let JARVIS/Friday/Claude hand VOX tasks
     if hands_free:
         # always-listening (only good in a quiet room — picks up ANY speech, incl. TV/other people)
         print("🎙️  VOX is live (hands-free). Speak anytime; talk over me to interrupt. Say \"goodbye\" to exit.\n")
