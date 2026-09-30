@@ -33,6 +33,8 @@ LLM_BASE = os.getenv("VOX_LLM_BASE", "https://api.groq.com/openai/v1")
 SR = 16000                    # mic sample rate for VAD + Whisper
 FRAME_MS = 20
 FRAME = SR * FRAME_MS // 1000  # 320 samples/frame
+WAKE_MIN_RMS = int(os.getenv("VOX_MIN_RMS", "450"))   # ignore background quieter than this (near-field gate)
+_last_rms = 0.0               # loudness of the most recent utterance (for the near-field/background gate)
 WAKE = os.getenv("VOX_WAKE", "Hey Vox")               # wake phrase for hands-free mode
 # Whisper (base.en) often mishears 'Vox' — accept these look-alikes as the wake token.
 _WAKE_ALTS = ("vox", "box", "fox", "vaux", "volks", "folks", "walks", "vaults", "vault",
@@ -206,6 +208,8 @@ def record_utterance(max_sec=15, start_timeout=10, end_silence_ms=800, device=No
                 if silence_run >= end_frames or len(voiced) * FRAME_MS / 1000 > max_sec:
                     break
     pcm = np.frombuffer(b"".join(voiced), dtype=np.int16)
+    global _last_rms                                     # loudness, for the near-field/background gate
+    _last_rms = float(np.sqrt(np.mean(pcm.astype(np.float32) ** 2))) if pcm.size else 0.0
     wav = os.path.join(tempfile.gettempdir(), f"vox_utt_{int(time.time()*1000)}.wav")
     sf.write(wav, pcm, SR)
     return wav
@@ -322,13 +326,17 @@ def run_wake(device=None):
         wav = record_utterance(device=device, start_timeout=3600)   # wait for any speech
         if not wav:
             continue
+        if WAKE_MIN_RMS and _last_rms < WAKE_MIN_RMS:               # too quiet = distant background (TV) — ignore
+            os.remove(wav)
+            print(f"   (ignored background — volume {int(_last_rms)} below {WAKE_MIN_RMS}; speak toward the mic)")
+            continue
         text = transcribe(wav); os.remove(wav)
         if not text:
             print("   (heard sound but no words — mic may be too quiet or the wrong device)")
             continue
         cmd = _wake_match(text)
         if cmd is None:
-            print(f'   (heard: "{text}" — not the wake word; say "Hey Vox" first)')
+            print(f'   (heard: "{text}" [vol {int(_last_rms)}] — not the wake word; say "Hey Vox" first)')
             continue
         print(f'👂 wake heard: "{text}"')
         if not cmd:                      # they said only the wake word — ask what they need
