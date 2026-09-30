@@ -295,7 +295,9 @@ def run_enroll(device=None, samples=7):
         others = np.delete(E, k, axis=0).mean(0); others = others / np.linalg.norm(others)
         loo.append(float(np.dot(embs[k], others)))
     loo = np.array(loo)
-    thr = float(np.clip(loo.mean() - 1.5 * loo.std(), 0.40, 0.55))
+    # Cap at 0.50, not the enrollment self-similarity: enrollment (deliberate, clean) scores much higher than
+    # real casual wake-mode speech, so a high enrollment consistency must NOT push the runtime bar up.
+    thr = float(np.clip(loo.mean() - 1.5 * loo.std(), 0.40, 0.50))
     np.savez(VOICEPRINT_PATH, vp=centroid.astype(np.float32), threshold=np.float32(thr),
              samples=E.astype(np.float32))
     old = VOICEPRINT_PATH[:-4] + ".npy"                  # remove the stale first-format file if present
