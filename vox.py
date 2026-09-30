@@ -275,10 +275,17 @@ def _wake_match(text: str):
     """If the utterance begins with the wake word ('Hey Vox', tolerant of Whisper mishearings),
     return the command that follows it (possibly ''). Otherwise return None so it's ignored."""
     words = re.sub(r"[^a-z0-9' ]", " ", text.lower()).split()
-    greet = {"hey", "hi", "ok", "okay", "yo", "hello", "hay", "a"}
+    # Whisper mangles the "Hey" in "Hey Vox" into all sorts of short fillers — accept them as the greeting.
+    greet = {"hey", "hay", "he", "hi", " hi", "in", "and", "an", "a", "uh", "um", "oh", "ah",
+             "ok", "okay", "ey", "ay", "yo", "hello", "hallo", "they", "i", "eh", "hivox"}
     for i in range(min(4, len(words))):        # only near the start, so mid-sentence look-alikes don't trigger
         if words[i] in _WAKE_ALTS and (i == 0 or words[i - 1] in greet):
             return " ".join(words[i + 1:]).strip()
+        # merged form Whisper sometimes emits, e.g. "heyvox" / "hivox" (never real words)
+        for g in ("hey", "hi"):
+            for v in _WAKE_ALTS:
+                if words[i] == g + v:
+                    return " ".join(words[i + 1:]).strip()
     return None
 
 
@@ -320,7 +327,9 @@ def run_wake(device=None):
         print(f"👤 you: {cmd}")
         hist.append({"role": "user", "content": cmd})
         reply, hist = think(hist)
-        say(reply, bargein=True)
+        # bargein=False: with speakers, an open mic hears VOX's OWN voice and self-interrupts. Replies are
+        # short (1-2 sentences), so play them fully. (Barge-in needs a headset to avoid the echo.)
+        say(reply, bargein=False)
         print()
         if re.search(r"\b(goodbye|good night|stop listening|that's all|we're done)\b", cmd, re.I):
             say("Talk soon."); break
@@ -343,7 +352,7 @@ def run_live(device=None, hands_free=False):
             print(f"👤 you: {text}")
             hist.append({"role": "user", "content": text})
             reply, hist = think(hist)
-            say(reply, bargein=True)
+            say(reply, bargein=False)   # speakers: an open mic self-interrupts on VOX's own voice
             if re.search(r"\b(goodbye|bye|good night)\b", text, re.I):
                 say("Talk soon."); break
         return
