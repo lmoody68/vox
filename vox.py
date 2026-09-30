@@ -43,10 +43,13 @@ _WAKE_ALTS = ("vox", "box", "fox", "vaux", "volks", "folks", "walks", "vaults", 
               "vocs", "vex", "bucks", "vaux", "vaughs", "faux", "vox's")
 
 # ── voiceprint (optional speaker verification — only answer the enrolled owner, ignore TV/other people) ──
-VOICEPRINT_PATH = os.path.join(HERE, "voiceprint.npy")     # enrolled owner embedding (created by --enroll)
+VOICEPRINT_PATH = os.path.join(HERE, "voiceprint.npz")     # enrolled owner voiceprint + calibrated threshold (--enroll)
 ECAPA_DIR = os.path.join(HERE, "models", "ecapa")          # local cache of the ECAPA-TDNN speaker model
-VERIFY_THRESHOLD = float(os.getenv("VOX_VOICEPRINT_THRESHOLD", "0.55"))  # cosine cutoff (same-speaker >0.7, others <0.35)
+_THRESH_OVERRIDE = os.getenv("VOX_VOICEPRINT_THRESHOLD")   # set to force a fixed cutoff; else per-voiceprint calibrated
+DEFAULT_THRESHOLD = 0.50                                   # fallback cutoff (same-speaker >0.6, other people <0.35)
+MIN_VERIFY_SEC = float(os.getenv("VOX_MIN_VERIFY_SEC", "1.5"))  # clips with less speech than this can't be verified reliably
 _encoder = None                                            # cached ECAPA encoder (False = tried and unavailable)
+_last_speech_sec = 0.0                                     # voiced-speech duration of the most recent utterance
 
 _PERSONA = ("You are Vox, a friendly, concise voice assistant. Your name is Vox — always write and say it as a "
             "single word (Vox), never spell it out. Keep replies to 1-2 sentences — you are being spoken aloud. "
@@ -201,41 +204,69 @@ def embed_wav(wav_path):
 
 
 def load_voiceprint():
-    """Return the saved owner embedding (normalised), or None if not enrolled."""
-    if not os.path.exists(VOICEPRINT_PATH):
-        return None
+    """Return (centroid, threshold) for the enrolled owner, or None. Handles the new .npz and the old .npy."""
+    path = VOICEPRINT_PATH
+    if not os.path.exists(path):
+        old = path[:-4] + ".npy"                         # back-compat with the first-cut single-vector format
+        if not os.path.exists(old):
+            return None
+        try:
+            vp = np.load(old).astype(np.float32); n = float(np.linalg.norm(vp))
+            return (vp / n, DEFAULT_THRESHOLD) if n else None
+        except Exception:
+            return None
     try:
-        vp = np.load(VOICEPRINT_PATH).astype(np.float32)
-        n = float(np.linalg.norm(vp))
-        return vp / n if n else None
+        z = np.load(path)
+        vp = z["vp"].astype(np.float32); n = float(np.linalg.norm(vp))
+        if not n:
+            return None
+        thr = float(z["threshold"]) if "threshold" in z.files else DEFAULT_THRESHOLD
+        return vp / n, thr
     except Exception:
         return None
 
 
+def active_threshold(saved_thr=DEFAULT_THRESHOLD):
+    """The cutoff in force: an explicit env override wins, else the value calibrated at enrollment."""
+    try:
+        return float(_THRESH_OVERRIDE) if _THRESH_OVERRIDE else saved_thr
+    except ValueError:
+        return saved_thr
+
+
 def verify_speaker(wav_path):
-    """(ok, score). Not enrolled -> (True, -1). Can't embed -> (True, -2) (fail-open so VOX still works)."""
-    vp = load_voiceprint()
-    if vp is None:
-        return True, -1.0
+    """(ok, score, thr). Not enrolled -> (True,-1). Too short to judge -> (True,-3) (wake+proximity gate it).
+    Can't embed -> (True,-2) (fail-open so VOX still works). Otherwise ok = score >= threshold."""
+    vpt = load_voiceprint()
+    if vpt is None:
+        return True, -1.0, DEFAULT_THRESHOLD
+    vp, saved_thr = vpt
+    thr = active_threshold(saved_thr)
+    if _last_speech_sec and _last_speech_sec < MIN_VERIFY_SEC:
+        return True, -3.0, thr                           # not enough speech to fingerprint reliably — accept
     emb = embed_wav(wav_path)
     if emb is None:
-        return True, -2.0
+        return True, -2.0, thr
     score = float(np.dot(emb, vp))
-    return score >= VERIFY_THRESHOLD, score
+    return score >= thr, score, thr
 
 
-def run_enroll(device=None, samples=5):
-    """Record several utterances and save YOUR voiceprint, so wake mode ignores the TV and other people."""
+def run_enroll(device=None, samples=7):
+    """Record several utterances, build YOUR voiceprint, and auto-calibrate the match threshold to your voice."""
     print("\n🔒 VOX voiceprint enrollment — teach VOX your voice so it only listens to you.")
     if _get_encoder() is None:
         print("   Speaker model unavailable — cannot enroll.  (Fix:  pip install speechbrain)\n"); return
     warm_stt()
+    print("   Speak NATURALLY — the way you'll actually talk to VOX, from your usual seat and distance.")
     phrases = [
         "Hey Vox, what's on my calendar today?",
         "Hey Vox, set a timer for ten minutes please.",
-        "The quick brown fox jumps over the lazy dog.",
         "Hey Vox, what's the weather like this afternoon?",
-        "I am enrolling my voice so you only listen to me.",
+        "Hey Vox, add milk and eggs to my shopping list.",
+        "Hey Vox, play some music and turn the volume up.",
+        "Hey Vox, remind me to call the dentist tomorrow.",
+        "Hey Vox, tell me a fun fact about the ocean please.",
+        "Hey Vox, how long does it take to drive downtown?",
     ]
     embs, i = [], 0
     while len(embs) < samples:
@@ -249,18 +280,33 @@ def run_enroll(device=None, samples=5):
         wav = record_utterance(device=device, start_timeout=8, max_sec=8)
         if not wav:
             print("   (heard nothing — let's redo that one)"); continue
+        if _last_speech_sec < 1.2:                       # too short to enroll a stable sample
+            os.remove(wav); print(f"   (only {_last_speech_sec:.1f}s of speech — say the whole phrase, redo)"); continue
         emb = embed_wav(wav); os.remove(wav)
         if emb is None:
             print("   (couldn't read that clearly — redo)"); continue
-        embs.append(emb); print("   ✓ got it")
-    vp = np.mean(np.stack(embs), axis=0)
-    vp = vp / np.linalg.norm(vp)
-    sims = [float(np.dot(a, b)) for x, a in enumerate(embs) for b in embs[x + 1:]]
-    consistency = sum(sims) / len(sims) if sims else 0.0
-    np.save(VOICEPRINT_PATH, vp.astype(np.float32))
+        embs.append(emb); print(f"   ✓ got it  ({_last_speech_sec:.1f}s)")
+    E = np.stack(embs)
+    centroid = E.mean(0); centroid = centroid / np.linalg.norm(centroid)
+    # Auto-calibrate: leave-one-out genuine similarity (conservative — runtime scores against the FULL centroid,
+    # so they run a little higher). Threshold = mean - 1.5*std, floored to keep other people out, capped for safety.
+    loo = []
+    for k in range(len(embs)):
+        others = np.delete(E, k, axis=0).mean(0); others = others / np.linalg.norm(others)
+        loo.append(float(np.dot(embs[k], others)))
+    loo = np.array(loo)
+    thr = float(np.clip(loo.mean() - 1.5 * loo.std(), 0.40, 0.55))
+    np.savez(VOICEPRINT_PATH, vp=centroid.astype(np.float32), threshold=np.float32(thr),
+             samples=E.astype(np.float32))
+    old = VOICEPRINT_PATH[:-4] + ".npy"                  # remove the stale first-format file if present
+    if os.path.exists(old):
+        try: os.remove(old)
+        except Exception: pass
     print(f"\n   🔒 Saved your voiceprint → {VOICEPRINT_PATH}")
-    print(f"   Sample self-consistency: {consistency:.2f}   ·   match threshold: {VERIFY_THRESHOLD:.2f} (others score <0.35)")
-    print("   Wake mode now responds ONLY to your voice. (Delete voiceprint.npy to turn this off.)\n")
+    print(f"   Your voice consistency (leave-one-out): mean {loo.mean():.2f} · spread {loo.std():.2f}")
+    print(f"   Auto-set match threshold: {thr:.2f}   (other people typically score under 0.35)")
+    print(f"   Short commands (< {MIN_VERIFY_SEC:.1f}s) are accepted on wake-word + proximity (too little audio to verify).")
+    print("   Wake mode now responds ONLY to your voice.  (Delete voiceprint.npz to turn this off.)\n")
 
 
 # ── TTS (edge-tts → mp3 → PCM via bundled ffmpeg) ───────────────────────────────────────────────────
@@ -302,7 +348,7 @@ def record_utterance(max_sec=15, start_timeout=10, end_silence_ms=800, device=No
     """Open the mic, wait for speech, record until `end_silence_ms` of silence. Returns wav path or None."""
     import sounddevice as sd, soundfile as sf, webrtcvad
     vad = webrtcvad.Vad(2)
-    voiced, started, silence_run, t0 = [], False, 0, time.time()
+    voiced, started, silence_run, speech_frames, t0 = [], False, 0, 0, time.time()
     end_frames = end_silence_ms // FRAME_MS
     with sd.RawInputStream(samplerate=SR, blocksize=FRAME, dtype="int16", channels=1, device=device) as stream:
         while True:
@@ -310,17 +356,21 @@ def record_utterance(max_sec=15, start_timeout=10, end_silence_ms=800, device=No
             is_speech = vad.is_speech(bytes(data), SR)
             if not started:
                 if is_speech:
-                    started = True; voiced.append(bytes(data))
+                    started = True; voiced.append(bytes(data)); speech_frames += 1
                 elif time.time() - t0 > start_timeout:
                     return None
             else:
                 voiced.append(bytes(data))
-                silence_run = silence_run + 1 if not is_speech else 0
+                if is_speech:
+                    speech_frames += 1; silence_run = 0
+                else:
+                    silence_run += 1
                 if silence_run >= end_frames or len(voiced) * FRAME_MS / 1000 > max_sec:
                     break
     pcm = np.frombuffer(b"".join(voiced), dtype=np.int16)
-    global _last_rms                                     # loudness, for the near-field/background gate
+    global _last_rms, _last_speech_sec                   # loudness (background gate) + speech length (verify gate)
     _last_rms = float(np.sqrt(np.mean(pcm.astype(np.float32) ** 2))) if pcm.size else 0.0
+    _last_speech_sec = speech_frames * FRAME_MS / 1000.0
     wav = os.path.join(tempfile.gettempdir(), f"vox_utt_{int(time.time()*1000)}.wav")
     sf.write(wav, pcm, SR)
     return wav
@@ -431,9 +481,11 @@ def run_wake(device=None):
         print(f"   (listening on mic: {name}  — if that's wrong, run with  --device N ; see  python vox.py --devices)\n")
     except Exception as e:
         print(f"   (could not read mic device: {e})\n")
-    if load_voiceprint() is not None:
+    _vp = load_voiceprint()
+    if _vp is not None:
         _get_encoder()                       # warm the speaker model so the first verification isn't slow
-        print(f"   🔒 Voiceprint ON — I'll only respond to YOUR enrolled voice (match ≥ {VERIFY_THRESHOLD:.2f}).\n")
+        print(f"   🔒 Voiceprint ON — I'll only respond to YOUR enrolled voice (match ≥ {active_threshold(_vp[1]):.2f}; "
+              f"short commands pass on proximity).\n")
     else:
         print("   🔓 Voiceprint off — I respond to any voice.  Lock to yours:  python vox.py --enroll\n")
     say(f"Hands-free mode on. Say {WAKE}, then your question.", bargein=False)
@@ -456,16 +508,17 @@ def run_wake(device=None):
             os.remove(wav)
             print(f'   (heard: "{text}" [vol {int(_last_rms)}] — not the wake word; say "Hey Vox" first)')
             continue
-        ok, score = verify_speaker(wav); os.remove(wav)   # wake word matched — but is it the owner's voice?
+        ok, score, thr = verify_speaker(wav); os.remove(wav)   # wake word matched — but is it the owner's voice?
         if not ok:
-            print(f'   (ignored "{text}" — not your enrolled voice; match {score:.2f} < {VERIFY_THRESHOLD:.2f})')
+            print(f'   (ignored "{text}" — not your enrolled voice; match {score:.2f} < {thr:.2f})')
             continue
-        print(f'👂 wake heard: "{text}"' + (f'  [you ✓ {score:.2f}]' if score >= 0 else ''))
+        tag = f'  [you ✓ {score:.2f}]' if score >= 0 else ('  [short — proximity]' if score == -3.0 else '')
+        print(f'👂 wake heard: "{text}"{tag}')
         if not cmd:                      # they said only the wake word — ask what they need
             say("Yes?", bargein=False)
             wav2 = record_utterance(device=device, start_timeout=8)
             if wav2:
-                ok2, _ = verify_speaker(wav2)             # verify the follow-up too, so the TV can't answer "Yes?"
+                ok2, _, _ = verify_speaker(wav2)          # verify the follow-up too, so the TV can't answer "Yes?"
                 cmd = transcribe(wav2) if ok2 else ""
                 os.remove(wav2)
                 if not ok2:

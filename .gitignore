@@ -6,3 +6,4 @@ __pycache__/
 models/
 # YOUR biometric voiceprint — personal, never commit
 voiceprint.npy
+voiceprint.npz
